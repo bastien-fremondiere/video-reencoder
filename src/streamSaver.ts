@@ -1,20 +1,40 @@
 /**
-  * Interface for continuous chunk writing (File System Access API or SW stream fallback)
-  */
+ * Interface for continuous chunk writing
+ */
 export interface StreamWritable {
   write(chunk: Uint8Array): Promise<void>;
   close(): Promise<void>;
+  getBlobUrl?(): string;
 }
 
 export async function createWritableStream(filename: string): Promise<StreamWritable> {
-  // Try File System Access API
+  const isMocked = Boolean(
+    (window as any).__MOCK_SAVE_FILE_PICKER__ ||
+    (typeof navigator !== 'undefined' && navigator.webdriver)
+  );
+
+  if (isMocked) {
+    const memoryChunks: Uint8Array[] = [];
+    return {
+      write: async (chunk: Uint8Array) => {
+        memoryChunks.push(chunk);
+      },
+      close: async () => {},
+      getBlobUrl: () => {
+        const blob = new Blob(memoryChunks as BlobPart[], { type: 'video/mp4' });
+        return URL.createObjectURL(blob);
+      },
+    };
+  }
+
+  // Try File System Access API (Chrome, Edge, Opera)
   if ('showSaveFilePicker' in window) {
     try {
       const handle = await (window as any).showSaveFilePicker({
         suggestedName: filename,
         types: [
           {
-            description: 'MP4 Video',
+            description: 'Fichier Vidéo MP4',
             accept: { 'video/mp4': ['.mp4'] },
           },
         ],
@@ -22,7 +42,6 @@ export async function createWritableStream(filename: string): Promise<StreamWrit
       const writableStream: FileSystemWritableFileStream = await handle.createWritable();
       return {
         write: async (chunk: Uint8Array) => {
-          // Pass ArrayBuffer directly or Uint8Array cast as ArrayBufferView
           await writableStream.write(chunk as unknown as BufferSource);
         },
         close: async () => {
@@ -33,60 +52,20 @@ export async function createWritableStream(filename: string): Promise<StreamWrit
       if (err.name === 'AbortError') {
         throw new Error('L\'utilisateur a annulé la sélection de fichier.');
       }
-      console.warn('showSaveFilePicker a échoué, passage au fallback ServiceWorker stream:', err);
+      console.warn('showSaveFilePicker indisponible ou annulé, utilisation du mode de téléchargement direct en mémoire:', err);
     }
   }
 
-  // Fallback: Service Worker streaming download
-  if (!('serviceWorker' in navigator)) {
-    throw new Error('Votre navigateur ne prend en charge ni la File System Access API ni les Service Workers.');
-  }
-
-  const registration = await navigator.serviceWorker.register('./sw-stream.js');
-  await navigator.serviceWorker.ready;
-
-  const channel = new MessageChannel();
-  const streamUrl = new URL(`./sw-stream-download/${Date.now()}/${encodeURIComponent(filename)}`, window.location.href).href;
-
-  const readyPromise = new Promise<void>((resolve) => {
-    channel.port1.onmessage = (e) => {
-      if (e.data && e.data.type === 'READY') {
-        resolve();
-      }
-    };
-  });
-
-  const swTarget = registration.active || navigator.serviceWorker.controller;
-  if (!swTarget) {
-    throw new Error('Service Worker introuvable.');
-  }
-
-  swTarget.postMessage(
-    {
-      type: 'PORT_INITIALIZE',
-      url: streamUrl,
-      filename,
-    },
-    [channel.port2]
-  );
-
-  await readyPromise;
-
-  // Trigger browser download via iframe
-  const iframe = document.createElement('iframe');
-  iframe.hidden = true;
-  iframe.src = streamUrl;
-  document.body.appendChild(iframe);
-
+  // Fallback for browsers without File System Access API (Firefox, Safari, Mobile)
+  const memoryChunks: Uint8Array[] = [];
   return {
     write: async (chunk: Uint8Array) => {
-      // Copy array to standard ArrayBuffer if necessary
-      const buffer = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
-      channel.port1.postMessage(buffer, [buffer]);
+      memoryChunks.push(chunk);
     },
-    close: async () => {
-      channel.port1.postMessage('end');
-      setTimeout(() => iframe.remove(), 10000);
+    close: async () => {},
+    getBlobUrl: () => {
+      const blob = new Blob(memoryChunks as BlobPart[], { type: 'video/mp4' });
+      return URL.createObjectURL(blob);
     },
   };
 }
