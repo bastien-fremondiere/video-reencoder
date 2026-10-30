@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>In-Browser Video Converter (WebCodecs & WASM)</title>
+    <script src="coi-serviceworker.js"></script>
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="app-header">
+        <div class="logo-container">
+          <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="23 7 16 12 23 17 23 7"></polygon>
+            <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+          </svg>
+          <h1>In-Browser Video Converter</h1>
+        </div>
+        <div id="coi-badge" class="badge badge-success">
+          <span class="dot"></span> SharedArrayBuffer Actif
+        </div>
+      </header>
+
+      <main class="app-main">
+        <!-- Zone Drag & Drop -->
+        <section id="drop-zone" class="drop-zone">
+          <input type="file" id="file-input" accept="video/*,.mkv,.webm,.mp4,.mov,.avi,.ts" hidden />
+          <div class="drop-zone-content">
+            <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="17 8 12 3 7 8"></polyline>
+              <line x1="12" y1="3" x2="12" y2="15"></line>
+            </svg>
+            <h2>Glissez-déposez un fichier vidéo ici</h2>
+            <p>Formats supportés : MKV, WebM, MP4, MOV, AVI, TS</p>
+            <button id="select-btn" class="btn btn-primary">Parcourir les fichiers</button>
+          </div>
+        </section>
+
+        <!-- Dynamic File Card & Processing Section -->
+        <section id="process-card" class="card hidden">
+          <div class="file-info-header">
+            <div class="file-details">
+              <span id="file-name" class="file-name">nom_fichier.mkv</span>
+              <span id="file-size" class="file-size">0 Mo</span>
+            </div>
+            <div id="processing-mode-badge" class="badge badge-mode hidden">
+              Mode Copie Directe
+            </div>
+          </div>
+
+          <!-- Actions Header -->
+          <div class="actions-group">
+            <button id="start-btn" class="btn btn-success">
+              <svg class="btn-icon" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+              Démarrer la conversion MP4
+            </button>
+            <button id="reset-btn" class="btn btn-secondary">Changer de fichier</button>
+          </div>
+
+          <!-- Progress Section -->
+          <div id="progress-container" class="progress-container hidden">
+            <div class="progress-bar-bg">
+              <div id="progress-bar-fill" class="progress-bar-fill" style="width: 0%"></div>
+            </div>
+            <div class="progress-percentage-label">
+              <span id="progress-percent">0%</span>
+            </div>
+
+            <!-- Stats Dashboard Grid -->
+            <div class="stats-grid">
+              <div class="stat-box">
+                <span class="stat-label">Vitesse (FPS)</span>
+                <span id="stat-fps" class="stat-value">0</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">Accélération</span>
+                <span id="stat-speed" class="stat-value">0x</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">Débit de sortie</span>
+                <span id="stat-bitrate" class="stat-value">0 Mo/s</span>
+              </div>
+              <div class="stat-box">
+                <span class="stat-label">Temps restant (ETA)</span>
+                <span id="stat-eta" class="stat-value">--:--</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Accordion Logs Console -->
+        <section class="card console-card">
+          <details open class="console-details">
+            <summary class="console-header">
+              <div class="console-title">
+                <svg class="console-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="4 17 10 11 4 5"></polyline>
+                  <line x1="12" y1="19" x2="20" y2="19"></line>
+                </svg>
+                <span>Console de logs système</span>
+              </div>
+              <button id="clear-logs-btn" class="btn-text">Effacer</button>
+            </summary>
+            <div id="log-console" class="log-console">
+              <div class="log-entry log-info">[Système] Prêt pour le traitement.</div>
+            </div>
+          </details>
+        </section>
+      </main>
+
+      <footer class="app-footer">
+        <p>100% Client-Side In-Browser MP4 Converter • Powered by WebCodecs, WebAssembly & mp4-muxer</p>
+      </footer>
+    </div>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>
