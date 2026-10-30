@@ -88,8 +88,13 @@ function mapLibavCodecToWebCodecs(codecId: number | string, codecName?: string):
 
 async function processVideoFile(file: File) {
   log('info', 'Chargement du module WASM libav.js...');
+  const origin = self.location.origin;
+  const base = `${origin}/libav/`;
+
   const libav = await LibAV.LibAV({
-    variant: 'webcodecs-avf',
+    noworker: true,
+    base,
+    toImport: `${base}libav-6.10.9.0-default.wasm.mjs`,
   });
 
   const filename = 'input_file';
