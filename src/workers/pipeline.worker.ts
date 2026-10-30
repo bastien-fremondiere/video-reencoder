@@ -219,21 +219,32 @@ async function processVideoFile(file: File) {
   }
 
   let audioEncoder: AudioEncoder | null = null;
+  let audioCodecCtx: any = null;
+  let audioFrame: any = null;
 
   if (audioStream && !audioPassthrough) {
-    audioEncoder = new AudioEncoder({
-      output: (chunk, metadata) => {
-        muxer.addAudioChunk(chunk, metadata);
-      },
-      error: (e) => log('error', `Erreur AudioEncoder: ${e.message}`),
-    });
+    audioCodecCtx = await libav.avcodec_alloc_context3(audioStream.codec_id);
+    await libav.avcodec_parameters_to_context(audioCodecCtx, audioStream);
+    const openRes = await libav.avcodec_open2_js(audioCodecCtx, 0, 0);
+    if (openRes < 0) {
+      log('warn', `Impossible d'ouvrir le décodeur audio libav (${openRes}), l'audio sera ignoré.`);
+      audioCodecCtx = null;
+    } else {
+      audioFrame = await libav.av_frame_alloc();
+      audioEncoder = new AudioEncoder({
+        output: (chunk, metadata) => {
+          muxer.addAudioChunk(chunk, metadata);
+        },
+        error: (e) => log('error', `Erreur AudioEncoder: ${e.message}`),
+      });
 
-    audioEncoder.configure({
-      codec: 'mp4a.40.2',
-      numberOfChannels: 2,
-      sampleRate: audioStream.sample_rate || 44100,
-      bitrate: 192000,
-    });
+      audioEncoder.configure({
+        codec: 'mp4a.40.2',
+        numberOfChannels: 2,
+        sampleRate: audioStream.sample_rate || 44100,
+        bitrate: 192000,
+      });
+    }
   }
 
   const startTime = performance.now();
@@ -303,6 +314,57 @@ async function processVideoFile(file: File) {
             data: p.data,
           });
           muxer.addAudioChunk(chunk);
+        } else if (audioEncoder && audioCodecCtx && audioFrame) {
+          const sendRes = await (libav as any).avcodec_send_packet(audioCodecCtx, (p as any).ptr || p);
+          if (sendRes >= 0) {
+            while (true) {
+              const receiveRes = await (libav as any).avcodec_receive_frame(audioCodecCtx, audioFrame);
+              if (receiveRes < 0) break;
+
+              const copiedFrame = await (libav as any).ff_copyout_frame(audioFrame);
+              if (copiedFrame && copiedFrame.data) {
+                const sampleRate = audioStream.sample_rate || 44100;
+                const channels = copiedFrame.channels || audioStream.channels || 2;
+                const nbSamples = copiedFrame.nb_samples || (copiedFrame.data.length / channels);
+
+                // Convert float32 PCM samples into WebCodecs AudioData
+                let pcmFloat32: Float32Array;
+                if (copiedFrame.data instanceof Float32Array) {
+                  pcmFloat32 = copiedFrame.data;
+                } else if (Array.isArray(copiedFrame.data) && copiedFrame.data[0] instanceof Float32Array) {
+                  // Planar float32
+                  pcmFloat32 = new Float32Array(nbSamples * channels);
+                  for (let ch = 0; ch < channels; ch++) {
+                    const chData = copiedFrame.data[ch];
+                    for (let s = 0; s < nbSamples; s++) {
+                      pcmFloat32[s * channels + ch] = chData[s] || 0;
+                    }
+                  }
+                } else {
+                  pcmFloat32 = new Float32Array(copiedFrame.data);
+                }
+
+                const framePtsUs = copiedFrame.pts != null && audioStream.time_base_den
+                  ? (copiedFrame.pts * audioStream.time_base_num * 1000000) / audioStream.time_base_den
+                  : ptsUs;
+
+                try {
+                  const audioData = new AudioData({
+                    format: 'f32',
+                    sampleRate,
+                    numberOfChannels: channels,
+                    numberOfFrames: nbSamples,
+                    timestamp: Math.round(framePtsUs),
+                    data: pcmFloat32.buffer as ArrayBuffer,
+                  });
+                  audioEncoder.encode(audioData);
+                  audioData.close();
+                } catch (audioEncErr: any) {
+                  log('warn', `Avertissement encodage audio: ${audioEncErr.message}`);
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -328,6 +390,13 @@ async function processVideoFile(file: File) {
   }
 
   await libav.av_packet_free(pkt);
+
+  if (audioFrame) {
+    await libav.av_frame_free(audioFrame);
+  }
+  if (audioCodecCtx) {
+    await libav.avcodec_free_context_js(audioCodecCtx);
+  }
 
   if (videoDecoder) {
     await videoDecoder.flush();

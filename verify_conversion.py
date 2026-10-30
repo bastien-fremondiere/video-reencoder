@@ -16,6 +16,10 @@ def run():
         )
         page = context.new_page()
 
+        page.on("console", lambda msg: print(f"[CONSOLE {msg.type}] {msg.text}"))
+        page.on("pageerror", lambda err: print(f"[PAGE ERROR] {err}"))
+        page.on("worker", lambda worker: worker.on("console", lambda msg: print(f"[WORKER CONSOLE] {msg.text}")))
+
         page.add_init_script("window.__MOCK_SAVE_FILE_PICKER__ = true;")
 
         page.goto("http://localhost:4173")

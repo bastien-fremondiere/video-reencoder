@@ -90,6 +90,71 @@
           </div>
         </section>
 
+        <!-- Interactive Split-Screen Comparison Section -->
+        <section id="compare-section" class="card hidden">
+          <div class="compare-header">
+            <h2>Comparateur Visuel & Audio (Avant / Après)</h2>
+            <p>Glissez le curseur central pour comparer la qualité d'image en direct de gauche à droite.</p>
+          </div>
+
+          <!-- Visual Split Container -->
+          <div id="comparison-viewer" class="comparison-viewer">
+            <!-- Source Video (Bottom / Left) -->
+            <video id="source-preview" playsinline muted class="compare-video"></video>
+
+            <!-- Converted Video Overlay (Top / Right) -->
+            <div id="converted-wrapper" class="converted-wrapper">
+              <video id="converted-preview" playsinline class="compare-video"></video>
+            </div>
+
+            <!-- Vertical Divider Handle -->
+            <div id="compare-divider" class="compare-divider" style="left: 50%;">
+              <div class="divider-line"></div>
+              <div class="divider-handle">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5">
+                  <polyline points="15 18 9 12 15 6"></polyline>
+                  <polyline points="9 18 15 12 9 6"></polyline>
+                </svg>
+              </div>
+            </div>
+
+            <!-- Overlay Labels -->
+            <span class="compare-label label-left">Source (<span id="source-format-label">Original</span>)</span>
+            <span class="compare-label label-right">Converti (MP4 H.264/AAC)</span>
+
+            <!-- Range Input overlaying viewer for dragging -->
+            <input type="range" id="compare-slider" min="0" max="100" value="50" class="compare-slider-input" />
+          </div>
+
+          <!-- Unified Player & Audio Controls -->
+          <div class="player-controls-bar">
+            <button id="compare-play-btn" class="btn btn-primary btn-sm">
+              ▶ Lecture
+            </button>
+
+            <input type="range" id="compare-timeline" min="0" max="100" value="0" step="0.1" class="timeline-slider" />
+
+            <span id="compare-time" class="time-display">00:00 / 00:00</span>
+
+            <div class="audio-toggle-group">
+              <span class="audio-label">Piste Audio :</span>
+              <button id="audio-converted-btn" class="btn btn-xs btn-outline active">MP4 Converti</button>
+              <button id="audio-source-btn" class="btn btn-xs btn-outline">Source</button>
+            </div>
+          </div>
+
+          <div class="download-footer">
+            <a id="download-btn" class="btn btn-success" download="converted.mp4">
+              <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                <polyline points="7 10 12 15 17 10"></polyline>
+                <line x1="12" y1="15" x2="12" y2="3"></line>
+              </svg>
+              Télécharger le fichier MP4
+            </a>
+          </div>
+        </section>
+
         <!-- Accordion Logs Console -->
         <section class="card console-card">
           <details open class="console-details">

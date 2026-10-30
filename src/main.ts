@@ -27,9 +27,26 @@ const statEta = document.getElementById('stat-eta') as HTMLElement;
 const logConsole = document.getElementById('log-console') as HTMLElement;
 const clearLogsBtn = document.getElementById('clear-logs-btn') as HTMLButtonElement;
 
+// Compare Section DOM Elements
+const compareSection = document.getElementById('compare-section') as HTMLElement;
+const sourceFormatLabel = document.getElementById('source-format-label') as HTMLElement;
+const sourcePreview = document.getElementById('source-preview') as HTMLVideoElement;
+const convertedWrapper = document.getElementById('converted-wrapper') as HTMLElement;
+const convertedPreview = document.getElementById('converted-preview') as HTMLVideoElement;
+const compareDivider = document.getElementById('compare-divider') as HTMLElement;
+const compareSlider = document.getElementById('compare-slider') as HTMLInputElement;
+
+const comparePlayBtn = document.getElementById('compare-play-btn') as HTMLButtonElement;
+const compareTimeline = document.getElementById('compare-timeline') as HTMLInputElement;
+const compareTime = document.getElementById('compare-time') as HTMLElement;
+const audioConvertedBtn = document.getElementById('audio-converted-btn') as HTMLButtonElement;
+const audioSourceBtn = document.getElementById('audio-source-btn') as HTMLButtonElement;
+const downloadBtn = document.getElementById('download-btn') as HTMLAnchorElement;
+
 let selectedFile: File | null = null;
 let activeWorker: Worker | null = null;
 let activeWritableStream: StreamWritable | null = null;
+let outputChunks: Uint8Array[] = [];
 
 // Log helper
 function appendLog(level: 'info' | 'warn' | 'error' | 'success', message: string) {
@@ -79,12 +96,16 @@ resetBtn.addEventListener('click', () => {
     activeWorker = null;
   }
   selectedFile = null;
+  outputChunks = [];
   fileInput.value = '';
   processCard.classList.add('hidden');
+  compareSection.classList.add('hidden');
   dropZone.classList.remove('hidden');
   progressContainer.classList.add('hidden');
   modeBadge.classList.add('hidden');
   startBtn.disabled = false;
+  sourcePreview.src = '';
+  convertedPreview.src = '';
   appendLog('info', 'Fichier réinitialisé.');
 });
 
@@ -92,6 +113,12 @@ function handleFileSelected(file: File) {
   selectedFile = file;
   fileNameEl.textContent = file.name;
   fileSizeEl.textContent = `${(file.size / (1024 * 1024)).toFixed(2)} Mo`;
+
+  const ext = file.name.split('.').pop()?.toUpperCase() || 'SOURCE';
+  sourceFormatLabel.textContent = ext;
+
+  const sourceUrl = URL.createObjectURL(file);
+  sourcePreview.src = sourceUrl;
 
   dropZone.classList.add('hidden');
   processCard.classList.remove('hidden');
@@ -105,17 +132,73 @@ function formatETA(seconds: number): string {
   return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
 }
 
+function formatTime(sec: number): string {
+  if (isNaN(sec) || !isFinite(sec)) return '00:00';
+  const mins = Math.floor(sec / 60);
+  const secs = Math.floor(sec % 60);
+  return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+}
+
+// Split-screen comparison slider handler
+compareSlider.addEventListener('input', () => {
+  const val = Number(compareSlider.value);
+  convertedWrapper.style.width = `${100 - val}%`;
+  compareDivider.style.left = `${val}%`;
+});
+
+// Synchronized video playback controls
+comparePlayBtn.addEventListener('click', () => {
+  if (convertedPreview.paused) {
+    sourcePreview.play().catch(() => {});
+    convertedPreview.play().catch(() => {});
+    comparePlayBtn.textContent = '❚❚ Pause';
+  } else {
+    sourcePreview.pause();
+    convertedPreview.pause();
+    comparePlayBtn.textContent = '▶ Lecture';
+  }
+});
+
+convertedPreview.addEventListener('timeupdate', () => {
+  if (!convertedPreview.duration) return;
+  const progressPercent = (convertedPreview.currentTime / convertedPreview.duration) * 100;
+  compareTimeline.value = progressPercent.toString();
+  compareTime.textContent = `${formatTime(convertedPreview.currentTime)} / ${formatTime(convertedPreview.duration)}`;
+});
+
+compareTimeline.addEventListener('input', () => {
+  if (!convertedPreview.duration) return;
+  const seekTime = (Number(compareTimeline.value) / 100) * convertedPreview.duration;
+  sourcePreview.currentTime = seekTime;
+  convertedPreview.currentTime = seekTime;
+});
+
+// Audio track switching
+audioConvertedBtn.addEventListener('click', () => {
+  audioConvertedBtn.classList.add('active');
+  audioSourceBtn.classList.remove('active');
+  convertedPreview.muted = false;
+  sourcePreview.muted = true;
+});
+
+audioSourceBtn.addEventListener('click', () => {
+  audioSourceBtn.classList.add('active');
+  audioConvertedBtn.classList.remove('active');
+  sourcePreview.muted = false;
+  convertedPreview.muted = true;
+});
+
 // Start conversion pipeline
 startBtn.addEventListener('click', async () => {
   if (!selectedFile) return;
 
+  outputChunks = [];
   const outputFilename = selectedFile.name.replace(/\.[^/.]+$/, '') + '_converted.mp4';
 
   try {
     startBtn.disabled = true;
     appendLog('info', 'Initialisation du flux de sortie zéro-RAM...');
 
-    // Prompt user for save file / initialize SW stream
     activeWritableStream = await createWritableStream(outputFilename);
     appendLog('success', 'Destination de sortie prête.');
 
@@ -123,7 +206,6 @@ startBtn.addEventListener('click', async () => {
     progressBarFill.style.width = '0%';
     progressPercent.textContent = '0%';
 
-    // Instantiate pipeline Web Worker
     activeWorker = new Worker(new URL('./workers/pipeline.worker.ts', import.meta.url), {
       type: 'module',
     });
@@ -151,8 +233,10 @@ startBtn.addEventListener('click', async () => {
           modeBadge.className = 'badge badge-mode transcode';
         }
       } else if (data.type === 'CHUNK') {
+        const chunkArray = new Uint8Array(data.chunk);
+        outputChunks.push(chunkArray);
         if (activeWritableStream) {
-          await activeWritableStream.write(new Uint8Array(data.chunk));
+          await activeWritableStream.write(chunkArray);
         }
       } else if (data.type === 'DONE') {
         if (activeWritableStream) {
@@ -162,6 +246,20 @@ startBtn.addEventListener('click', async () => {
         progressBarFill.style.width = '100%';
         progressPercent.textContent = '100%';
         appendLog('success', '🎉 Conversion et écriture sur disque réussies !');
+
+        // Prepare video comparison preview & download link
+        const blob = new Blob(outputChunks as BlobPart[], { type: 'video/mp4' });
+        const convertedUrl = URL.createObjectURL(blob);
+        convertedPreview.src = convertedUrl;
+        downloadBtn.href = convertedUrl;
+        downloadBtn.download = outputFilename;
+
+        // Default: play converted audio
+        convertedPreview.muted = false;
+        sourcePreview.muted = true;
+
+        compareSection.classList.remove('hidden');
+
         if (activeWorker) {
           activeWorker.terminate();
           activeWorker = null;
@@ -180,7 +278,6 @@ startBtn.addEventListener('click', async () => {
       }
     };
 
-    // Send start message
     const startMsg: WorkerStartMessage = {
       type: 'START',
       file: selectedFile,
