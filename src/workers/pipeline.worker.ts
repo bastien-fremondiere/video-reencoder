@@ -87,18 +87,23 @@ function mapLibavCodecToWebCodecs(codecId: number | string, codecName?: string):
 }
 
 async function processVideoFile(file: File) {
-  log('info', 'Chargement du module WASM libav.js...');
-  const origin = self.location.origin;
-  const base = `${origin}/libav/`;
+  log('info', 'Chargement du module WASM libav.js (variante webcodecs)...');
+  // Worker is located at [base]/assets/pipeline.worker-[hash].js
+  // Resolve base directory relative to the worker script location
+  const base = new URL('../libav/', import.meta.url).href;
 
   const libav = await LibAV.LibAV({
     noworker: true,
+    variant: 'webcodecs',
     base,
-    toImport: `${base}libav-6.10.9.0-default.wasm.mjs`,
+    toImport: `${base}libav-6.10.9.0-webcodecs.wasm.mjs`,
   });
 
-  const filename = 'input_file';
-  await libav.mkworkerfsfile(filename, file);
+  const filename = file.name || 'input_file.mkv';
+
+  log('info', 'Chargement du fichier vidéo en mémoire virtuelle...');
+  const arrayBuf = await file.arrayBuffer();
+  await libav.writeFile(filename, new Uint8Array(arrayBuf));
 
   log('info', 'Ouverture du fichier et analyse des flux...');
   const [fmt_ctx, streams] = await libav.ff_init_demuxer_file(filename);
@@ -110,6 +115,21 @@ async function processVideoFile(file: File) {
 
   for (let i = 0; i < streams.length; i++) {
     const s: any = streams[i];
+    if (s.codecpar) {
+      s.width = await (libav as any).AVCodecParameters_width(s.codecpar);
+      s.height = await (libav as any).AVCodecParameters_height(s.codecpar);
+      s.sample_rate = await (libav as any).AVCodecParameters_sample_rate(s.codecpar);
+      try {
+        s.channels = await (libav as any).AVCodecParameters_ch_layout_nb_channels(s.codecpar);
+      } catch {
+        s.channels = 2;
+      }
+      const extradataSize = await (libav as any).AVCodecParameters_extradata_size(s.codecpar);
+      const extradataPtr = await (libav as any).AVCodecParameters_extradata(s.codecpar);
+      if (extradataSize > 0 && extradataPtr) {
+        s.extradata = await (libav as any).copyout_u8(extradataPtr, extradataSize);
+      }
+    }
     if (s.codec_type === libav.AVMEDIA_TYPE_VIDEO && videoStreamIndex === -1) {
       videoStreamIndex = i;
       videoStream = s;
@@ -153,7 +173,7 @@ async function processVideoFile(file: File) {
 
   let bytesWritten = 0;
   const streamTarget = new MP4Muxer.StreamTarget({
-    onData: (data: Uint8Array) => {
+    onData: (data: Uint8Array, _position: number) => {
       bytesWritten += data.byteLength;
       emitChunk(data);
     },
@@ -257,23 +277,26 @@ async function processVideoFile(file: File) {
   let processedVideoFrames = 0;
   let lastTimestamp = 0;
 
-  log('info', 'Traitement des trames...');
+  log('info', 'Traitement des trames au fil de l\'eau...');
 
   const pkt = await libav.av_packet_alloc();
 
   while (true) {
-    const [readRes, streamPkts] = await libav.ff_read_frame_multi(fmt_ctx, pkt);
-    if (readRes === libav.AVERROR_EOF || !streamPkts) {
+    const readRes = await libav.av_read_frame(fmt_ctx, pkt);
+    if (readRes < 0) {
       break;
     }
 
-    const videoPkts = streamPkts[videoStreamIndex] || [];
-    for (const p of videoPkts) {
-      processedVideoFrames++;
-      const pts = p.pts ?? 0;
-      const flags = p.flags ?? 0;
-      const duration = p.duration ?? 0;
+    const streamIndex = await libav.AVPacket_stream_index(pkt);
+    const pts = await libav.AVPacket_pts(pkt);
+    const duration = await libav.AVPacket_duration(pkt);
+    const flags = await libav.AVPacket_flags(pkt);
+    const size = await libav.AVPacket_size(pkt);
+    const dataPtr = await libav.AVPacket_data(pkt);
+    const pktData = await libav.copyout_u8(dataPtr, size);
 
+    if (streamIndex === videoStreamIndex) {
+      processedVideoFrames++;
       const ptsUs = (pts * videoStream.time_base_num * 1000000) / videoStream.time_base_den;
       lastTimestamp = ptsUs / 1000000;
 
@@ -283,16 +306,26 @@ async function processVideoFile(file: File) {
           type: isKeyFrame ? 'key' : 'delta',
           timestamp: ptsUs,
           duration: (duration * videoStream.time_base_num * 1000000) / videoStream.time_base_den || 33333,
-          data: p.data,
+          data: pktData,
         });
-        muxer.addVideoChunk(chunk);
+
+        if (processedVideoFrames === 1 && videoStream.extradata) {
+          muxer.addVideoChunk(chunk, {
+            decoderConfig: {
+              codec: 'avc1.4d401f',
+              description: videoStream.extradata,
+            },
+          });
+        } else {
+          muxer.addVideoChunk(chunk);
+        }
       } else if (videoDecoder && videoDecoder.state === 'configured') {
         const isKeyFrame = Boolean(flags & 1);
         const chunk = new EncodedVideoChunk({
           type: isKeyFrame ? 'key' : 'delta',
           timestamp: ptsUs,
           duration: (duration * videoStream.time_base_num * 1000000) / videoStream.time_base_den || 33333,
-          data: p.data,
+          data: pktData,
         });
         try {
           videoDecoder.decode(chunk);
@@ -300,98 +333,87 @@ async function processVideoFile(file: File) {
           // ignore packet error
         }
       }
-    }
 
-    if (audioStream) {
-      const audioPkts = streamPkts[audioStreamIndex] || [];
-      for (const p of audioPkts) {
-        const pts = p.pts ?? 0;
-        const flags = p.flags ?? 0;
-        const duration = p.duration ?? 0;
+      if (processedVideoFrames % 15 === 0) {
+        const elapsedSec = (performance.now() - startTime) / 1000;
+        const fps = Math.round(processedVideoFrames / elapsedSec);
+        const speed = elapsedSec > 0 ? lastTimestamp / elapsedSec : 0;
+        const percent = durationSec > 0 ? Math.min(99, Math.round((lastTimestamp / durationSec) * 100)) : 0;
+        const bitrateMBs = elapsedSec > 0 ? bytesWritten / (1024 * 1024 * elapsedSec) : 0;
+        const etaSeconds = speed > 0 && durationSec > lastTimestamp ? Math.round((durationSec - lastTimestamp) / speed) : 0;
 
-        const ptsUs = (pts * audioStream.time_base_num * 1000000) / audioStream.time_base_den;
+        postMessage({
+          type: 'PROGRESS',
+          percent,
+          fps,
+          speed: parseFloat(speed.toFixed(2)),
+          bitrateMBs: parseFloat(bitrateMBs.toFixed(2)),
+          etaSeconds,
+          mode,
+        } as WorkerProgressMessage);
+      }
+    } else if (audioStream && streamIndex === audioStreamIndex) {
+      const ptsUs = (pts * audioStream.time_base_num * 1000000) / audioStream.time_base_den;
 
-        if (audioPassthrough) {
-          const isKeyFrame = Boolean(flags & 1);
-          const chunk = new EncodedAudioChunk({
-            type: isKeyFrame ? 'key' : 'delta',
-            timestamp: ptsUs,
-            duration: (duration * audioStream.time_base_num * 1000000) / audioStream.time_base_den || 23219,
-            data: p.data,
-          });
-          muxer.addAudioChunk(chunk);
-        } else if (audioEncoder && audioCodecCtx && audioFrame) {
-          const sendRes = await (libav as any).avcodec_send_packet(audioCodecCtx, (p as any).ptr || p);
-          if (sendRes >= 0) {
-            while (true) {
-              const receiveRes = await (libav as any).avcodec_receive_frame(audioCodecCtx, audioFrame);
-              if (receiveRes < 0) break;
+      if (audioPassthrough) {
+        const isKeyFrame = Boolean(flags & 1);
+        const chunk = new EncodedAudioChunk({
+          type: isKeyFrame ? 'key' : 'delta',
+          timestamp: ptsUs,
+          duration: (duration * audioStream.time_base_num * 1000000) / audioStream.time_base_den || 23219,
+          data: pktData,
+        });
+        muxer.addAudioChunk(chunk);
+      } else if (audioEncoder && audioCodecCtx && audioFrame) {
+        const sendRes = await (libav as any).avcodec_send_packet(audioCodecCtx, pkt);
+        if (sendRes >= 0) {
+          while (true) {
+            const receiveRes = await (libav as any).avcodec_receive_frame(audioCodecCtx, audioFrame);
+            if (receiveRes < 0) break;
 
-              const copiedFrame = await (libav as any).ff_copyout_frame(audioFrame);
-              if (copiedFrame && copiedFrame.data) {
-                const sampleRate = audioStream.sample_rate || 44100;
-                const channels = copiedFrame.channels || audioStream.channels || 2;
-                const nbSamples = copiedFrame.nb_samples || (copiedFrame.data.length / channels);
+            const copiedFrame = await (libav as any).ff_copyout_frame(audioFrame);
+            if (copiedFrame && copiedFrame.data) {
+              const sampleRate = audioStream.sample_rate || 44100;
+              const channels = copiedFrame.channels || audioStream.channels || 2;
+              const nbSamples = copiedFrame.nb_samples || (copiedFrame.data.length / channels);
 
-                // Convert float32 PCM samples into WebCodecs AudioData
-                let pcmFloat32: Float32Array;
-                if (copiedFrame.data instanceof Float32Array) {
-                  pcmFloat32 = copiedFrame.data;
-                } else if (Array.isArray(copiedFrame.data) && copiedFrame.data[0] instanceof Float32Array) {
-                  // Planar float32
-                  pcmFloat32 = new Float32Array(nbSamples * channels);
-                  for (let ch = 0; ch < channels; ch++) {
-                    const chData = copiedFrame.data[ch];
-                    for (let s = 0; s < nbSamples; s++) {
-                      pcmFloat32[s * channels + ch] = chData[s] || 0;
-                    }
+              let pcmFloat32: Float32Array;
+              if (copiedFrame.data instanceof Float32Array) {
+                pcmFloat32 = copiedFrame.data;
+              } else if (Array.isArray(copiedFrame.data) && copiedFrame.data[0] instanceof Float32Array) {
+                pcmFloat32 = new Float32Array(nbSamples * channels);
+                for (let ch = 0; ch < channels; ch++) {
+                  const chData = copiedFrame.data[ch];
+                  for (let s = 0; s < nbSamples; s++) {
+                    pcmFloat32[s * channels + ch] = chData[s] || 0;
                   }
-                } else {
-                  pcmFloat32 = new Float32Array(copiedFrame.data);
                 }
+              } else {
+                pcmFloat32 = new Float32Array(copiedFrame.data);
+              }
 
-                const framePtsUs = copiedFrame.pts != null && audioStream.time_base_den
-                  ? (copiedFrame.pts * audioStream.time_base_num * 1000000) / audioStream.time_base_den
-                  : ptsUs;
+              const framePtsUs = copiedFrame.pts != null && audioStream.time_base_den
+                ? (copiedFrame.pts * audioStream.time_base_num * 1000000) / audioStream.time_base_den
+                : ptsUs;
 
-                try {
-                  const audioData = new AudioData({
-                    format: 'f32',
-                    sampleRate,
-                    numberOfChannels: channels,
-                    numberOfFrames: nbSamples,
-                    timestamp: Math.round(framePtsUs),
-                    data: pcmFloat32.buffer as ArrayBuffer,
-                  });
-                  audioEncoder.encode(audioData);
-                  audioData.close();
-                } catch (audioEncErr: any) {
-                  log('warn', `Avertissement encodage audio: ${audioEncErr.message}`);
-                }
+              try {
+                const audioData = new AudioData({
+                  format: 'f32',
+                  sampleRate,
+                  numberOfChannels: channels,
+                  numberOfFrames: nbSamples,
+                  timestamp: Math.round(framePtsUs),
+                  data: pcmFloat32.buffer as ArrayBuffer,
+                });
+                audioEncoder.encode(audioData);
+                audioData.close();
+              } catch (audioEncErr: any) {
+                log('warn', `Avertissement encodage audio: ${audioEncErr.message}`);
               }
             }
           }
         }
       }
-    }
-
-    if (processedVideoFrames > 0 && processedVideoFrames % 15 === 0) {
-      const elapsedSec = (performance.now() - startTime) / 1000;
-      const fps = Math.round(processedVideoFrames / elapsedSec);
-      const speed = elapsedSec > 0 ? lastTimestamp / elapsedSec : 0;
-      const percent = durationSec > 0 ? Math.min(99, Math.round((lastTimestamp / durationSec) * 100)) : 0;
-      const bitrateMBs = elapsedSec > 0 ? bytesWritten / (1024 * 1024 * elapsedSec) : 0;
-      const etaSeconds = speed > 0 && durationSec > lastTimestamp ? Math.round((durationSec - lastTimestamp) / speed) : 0;
-
-      postMessage({
-        type: 'PROGRESS',
-        percent,
-        fps,
-        speed: parseFloat(speed.toFixed(2)),
-        bitrateMBs: parseFloat(bitrateMBs.toFixed(2)),
-        etaSeconds,
-        mode,
-      } as WorkerProgressMessage);
     }
   }
 
@@ -417,7 +439,7 @@ async function processVideoFile(file: File) {
   muxer.finalize();
 
   await libav.avformat_close_input_js(fmt_ctx);
-  await libav.unlinkworkerfsfile(filename);
+  await libav.unlink(filename);
 
   log('success', 'Conversion terminée avec succès !');
 }
