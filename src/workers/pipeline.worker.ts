@@ -62,8 +62,9 @@ self.onmessage = async (e: MessageEvent<WorkerStartMessage>) => {
     await processVideoFile(file);
     postMessage({ type: 'DONE' } as WorkerDoneMessage);
   } catch (err: any) {
-    log('error', `Erreur de traitement: ${err.message || err}`);
-    postMessage({ type: 'ERROR', error: err.message || String(err) } as WorkerErrorMessage);
+    const errorMsg = err && err.stack ? `${err.name || 'Error'}: ${err.message || err}\n${err.stack}` : String(err?.message || err);
+    log('error', `Erreur de traitement: ${errorMsg}`);
+    postMessage({ type: 'ERROR', error: errorMsg } as WorkerErrorMessage);
   }
 };
 
