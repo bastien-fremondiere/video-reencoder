@@ -142,7 +142,7 @@ function formatTime(sec: number): string {
 // Split-screen comparison slider handler
 compareSlider.addEventListener('input', () => {
   const val = Number(compareSlider.value);
-  convertedWrapper.style.width = `${100 - val}%`;
+  convertedWrapper.style.clipPath = `inset(0 0 0 ${val}%)`;
   compareDivider.style.left = `${val}%`;
 });
 

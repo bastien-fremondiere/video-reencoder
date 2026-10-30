@@ -204,6 +204,12 @@ async function processVideoFile(file: File) {
   let encodedFramesCount = 0;
 
   if (!videoPassthrough) {
+    if (typeof VideoEncoder === 'undefined' || typeof VideoDecoder === 'undefined') {
+      throw new Error(
+        `Ce navigateur ne supporte pas WebCodecs (VideoEncoder/VideoDecoder) nécessaire pour réencoder ce format vidéo (${videoStream.codec_name || videoStream.codec_id}). Veuillez utiliser Chrome/Edge ou fournir un fichier source en H.264.`
+      );
+    }
+
     videoEncoder = new VideoEncoder({
       output: (chunk, metadata) => {
         muxer.addVideoChunk(chunk, metadata);
@@ -249,27 +255,31 @@ async function processVideoFile(file: File) {
   let audioFrame: any = null;
 
   if (audioStream && !audioPassthrough) {
-    audioCodecCtx = await libav.avcodec_alloc_context3(audioStream.codec_id);
-    await libav.avcodec_parameters_to_context(audioCodecCtx, audioStream);
-    const openRes = await libav.avcodec_open2_js(audioCodecCtx, 0, 0);
-    if (openRes < 0) {
-      log('warn', `Impossible d'ouvrir le décodeur audio libav (${openRes}), l'audio sera ignoré.`);
-      audioCodecCtx = null;
+    if (typeof AudioEncoder === 'undefined') {
+      log('warn', `AudioEncoder non supporté par ce navigateur. L'audio source (${audioStream.codec_name || audioStream.codec_id}) sera omis.`);
     } else {
-      audioFrame = await libav.av_frame_alloc();
-      audioEncoder = new AudioEncoder({
-        output: (chunk, metadata) => {
-          muxer.addAudioChunk(chunk, metadata);
-        },
-        error: (e) => log('error', `Erreur AudioEncoder: ${e.message}`),
-      });
+      audioCodecCtx = await libav.avcodec_alloc_context3(audioStream.codec_id);
+      await libav.avcodec_parameters_to_context(audioCodecCtx, audioStream);
+      const openRes = await libav.avcodec_open2_js(audioCodecCtx, 0, 0);
+      if (openRes < 0) {
+        log('warn', `Impossible d'ouvrir le décodeur audio libav (${openRes}), l'audio sera ignoré.`);
+        audioCodecCtx = null;
+      } else {
+        audioFrame = await libav.av_frame_alloc();
+        audioEncoder = new AudioEncoder({
+          output: (chunk, metadata) => {
+            muxer.addAudioChunk(chunk, metadata);
+          },
+          error: (e) => log('error', `Erreur AudioEncoder: ${e.message}`),
+        });
 
-      audioEncoder.configure({
-        codec: 'mp4a.40.2',
-        numberOfChannels: 2,
-        sampleRate: audioStream.sample_rate || 44100,
-        bitrate: 192000,
-      });
+        audioEncoder.configure({
+          codec: 'mp4a.40.2',
+          numberOfChannels: 2,
+          sampleRate: audioStream.sample_rate || 44100,
+          bitrate: 192000,
+        });
+      }
     }
   }
 
@@ -300,37 +310,35 @@ async function processVideoFile(file: File) {
       const ptsUs = (pts * videoStream.time_base_num * 1000000) / videoStream.time_base_den;
       lastTimestamp = ptsUs / 1000000;
 
-      if (videoPassthrough) {
-        const isKeyFrame = Boolean(flags & 1);
-        const chunk = new EncodedVideoChunk({
-          type: isKeyFrame ? 'key' : 'delta',
-          timestamp: ptsUs,
-          duration: (duration * videoStream.time_base_num * 1000000) / videoStream.time_base_den || 33333,
-          data: pktData,
-        });
+      const isKeyFrame = Boolean(flags & 1);
+      const frameDuration = (duration * videoStream.time_base_num * 1000000) / videoStream.time_base_den || 33333;
 
-        if (processedVideoFrames === 1 && videoStream.extradata) {
-          muxer.addVideoChunk(chunk, {
-            decoderConfig: {
-              codec: 'avc1.4d401f',
-              description: videoStream.extradata,
-            },
-          });
-        } else {
-          muxer.addVideoChunk(chunk);
-        }
-      } else if (videoDecoder && videoDecoder.state === 'configured') {
-        const isKeyFrame = Boolean(flags & 1);
-        const chunk = new EncodedVideoChunk({
-          type: isKeyFrame ? 'key' : 'delta',
-          timestamp: ptsUs,
-          duration: (duration * videoStream.time_base_num * 1000000) / videoStream.time_base_den || 33333,
-          data: pktData,
-        });
+      if (videoPassthrough) {
+        const meta = (processedVideoFrames === 1 && videoStream.extradata) ? {
+          decoderConfig: {
+            codec: 'avc1.4d401f',
+            description: videoStream.extradata,
+          },
+        } : undefined;
+
+        muxer.addVideoChunkRaw(
+          pktData,
+          isKeyFrame ? 'key' : 'delta',
+          ptsUs,
+          frameDuration,
+          meta
+        );
+      } else if (typeof VideoDecoder !== 'undefined' && videoDecoder && videoDecoder.state === 'configured') {
         try {
+          const chunk = new (self as any).EncodedVideoChunk({
+            type: isKeyFrame ? 'key' : 'delta',
+            timestamp: ptsUs,
+            duration: frameDuration,
+            data: pktData,
+          });
           videoDecoder.decode(chunk);
         } catch {
-          // ignore packet error
+          // ignore decode packet error
         }
       }
 
@@ -354,16 +362,16 @@ async function processVideoFile(file: File) {
       }
     } else if (audioStream && streamIndex === audioStreamIndex) {
       const ptsUs = (pts * audioStream.time_base_num * 1000000) / audioStream.time_base_den;
+      const isKeyFrame = Boolean(flags & 1);
+      const audioDuration = (duration * audioStream.time_base_num * 1000000) / audioStream.time_base_den || 23219;
 
       if (audioPassthrough) {
-        const isKeyFrame = Boolean(flags & 1);
-        const chunk = new EncodedAudioChunk({
-          type: isKeyFrame ? 'key' : 'delta',
-          timestamp: ptsUs,
-          duration: (duration * audioStream.time_base_num * 1000000) / audioStream.time_base_den || 23219,
-          data: pktData,
-        });
-        muxer.addAudioChunk(chunk);
+        muxer.addAudioChunkRaw(
+          pktData,
+          isKeyFrame ? 'key' : 'delta',
+          ptsUs,
+          audioDuration
+        );
       } else if (audioEncoder && audioCodecCtx && audioFrame) {
         const sendRes = await (libav as any).avcodec_send_packet(audioCodecCtx, pkt);
         if (sendRes >= 0) {
