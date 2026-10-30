@@ -145,8 +145,16 @@ async function processVideoFile(file: File) {
     }
   }
 
-  const muxerConfig: MP4Muxer.MuxerOptions<MP4Muxer.ArrayBufferTarget> = {
-    target: new MP4Muxer.ArrayBufferTarget(),
+  let bytesWritten = 0;
+  const streamTarget = new MP4Muxer.StreamTarget({
+    onData: (data: Uint8Array) => {
+      bytesWritten += data.byteLength;
+      emitChunk(data);
+    },
+  });
+
+  const muxerConfig: MP4Muxer.MuxerOptions<MP4Muxer.StreamTarget> = {
+    target: streamTarget,
     video: {
       codec: 'avc',
       width: videoStream.width || 1920,
@@ -163,24 +171,7 @@ async function processVideoFile(file: File) {
     };
   }
 
-  let bytesWritten = 0;
-  const muxer = new MP4Muxer.Muxer({
-    ...muxerConfig,
-    target: {
-      onHeader: (buffer: ArrayBuffer) => {
-        bytesWritten += buffer.byteLength;
-        emitChunk(new Uint8Array(buffer));
-      },
-      onCluster: (buffer: ArrayBuffer) => {
-        bytesWritten += buffer.byteLength;
-        emitChunk(new Uint8Array(buffer));
-      },
-      onTrailer: (buffer: ArrayBuffer) => {
-        bytesWritten += buffer.byteLength;
-        emitChunk(new Uint8Array(buffer));
-      },
-    } as any,
-  });
+  const muxer = new MP4Muxer.Muxer(muxerConfig);
 
   let videoDecoder: VideoDecoder | null = null;
   let videoEncoder: VideoEncoder | null = null;
@@ -216,14 +207,18 @@ async function processVideoFile(file: File) {
     });
 
     const inputDecoderCodec = mapLibavCodecToWebCodecs(videoStream.codec_id, videoStream.codec_name);
-    videoDecoder.configure({
+    const decoderConfig: VideoDecoderConfig = {
       codec: inputDecoderCodec,
       hardwareAcceleration: 'prefer-hardware',
-    });
+    };
+    if (videoStream.extradata) {
+      decoderConfig.description = videoStream.extradata;
+    }
+
+    videoDecoder.configure(decoderConfig);
   }
 
   let audioEncoder: AudioEncoder | null = null;
-  let audioDecoder: AudioDecoder | null = null;
 
   if (audioStream && !audioPassthrough) {
     audioEncoder = new AudioEncoder({
@@ -238,22 +233,6 @@ async function processVideoFile(file: File) {
       numberOfChannels: 2,
       sampleRate: audioStream.sample_rate || 44100,
       bitrate: 192000,
-    });
-
-    audioDecoder = new AudioDecoder({
-      output: (audioData) => {
-        if (audioEncoder && audioEncoder.state === 'configured') {
-          audioEncoder.encode(audioData);
-        }
-        audioData.close();
-      },
-      error: (e) => log('error', `Erreur AudioDecoder: ${e.message}`),
-    });
-
-    audioDecoder.configure({
-      codec: audioStream.codec_name || 'mp3',
-      numberOfChannels: audioStream.channels || 2,
-      sampleRate: audioStream.sample_rate || 44100,
     });
   }
 
@@ -324,19 +303,6 @@ async function processVideoFile(file: File) {
             data: p.data,
           });
           muxer.addAudioChunk(chunk);
-        } else if (audioDecoder && audioDecoder.state === 'configured') {
-          const isKeyFrame = Boolean(flags & 1);
-          const chunk = new EncodedAudioChunk({
-            type: isKeyFrame ? 'key' : 'delta',
-            timestamp: ptsUs,
-            duration: (duration * audioStream.time_base_num * 1000000) / audioStream.time_base_den || 23219,
-            data: p.data,
-          });
-          try {
-            audioDecoder.decode(chunk);
-          } catch {
-            // ignore packet error
-          }
         }
       }
     }
@@ -368,9 +334,6 @@ async function processVideoFile(file: File) {
   }
   if (videoEncoder) {
     await videoEncoder.flush();
-  }
-  if (audioDecoder) {
-    await audioDecoder.flush();
   }
   if (audioEncoder) {
     await audioEncoder.flush();
