@@ -1,9 +1,35 @@
 import LibAV from 'libav.js';
 import * as MP4Muxer from 'mp4-muxer';
 
+export interface StreamInfo {
+  index: number;
+  type: 'video' | 'audio' | 'subtitle' | 'unknown';
+  codecId: number;
+  codecName: string;
+  language: string;
+  title: string;
+  width?: number;
+  height?: number;
+  channels?: number;
+  sampleRate?: number;
+}
+
 export interface WorkerStartMessage {
   type: 'START';
   file: File;
+  selectedAudioIndex?: number; // Stream index for audio
+  selectedSubtitleIndex?: number; // Stream index for subtitle burn-in
+  externalSubtitleContent?: string; // External SRT or WebVTT string
+}
+
+export interface WorkerInspectMessage {
+  type: 'INSPECT';
+  file: File;
+}
+
+export interface WorkerInspectResultMessage {
+  type: 'INSPECT_RESULT';
+  streams: StreamInfo[];
 }
 
 export interface WorkerProgressMessage {
@@ -37,6 +63,7 @@ export interface WorkerErrorMessage {
 }
 
 export type WorkerToMainMessage =
+  | WorkerInspectResultMessage
   | WorkerProgressMessage
   | WorkerLogMessage
   | WorkerChunkMessage
@@ -52,14 +79,103 @@ function emitChunk(chunk: Uint8Array) {
   postMessage({ type: 'CHUNK', chunk: buffer } as WorkerChunkMessage, [buffer]);
 }
 
-self.onmessage = async (e: MessageEvent<WorkerStartMessage>) => {
+interface SubtitleCue {
+  start: number;
+  end: number;
+  text: string;
+}
+
+function parseSRTorVTT(content: string): SubtitleCue[] {
+  const cues: SubtitleCue[] = [];
+  const normalized = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^WEBVTT[^\n]*\n+/i, '');
+  const blocks = normalized.split(/\n\s*\n/);
+
+  function timeToSec(t: string): number {
+    const parts = t.trim().replace(',', '.').split(':');
+    if (parts.length === 3) {
+      const hours = parseFloat(parts[0]);
+      const minutes = parseFloat(parts[1]);
+      const seconds = parseFloat(parts[2]);
+      return hours * 3600 + minutes * 60 + seconds;
+    }
+    return 0;
+  }
+
+  for (const block of blocks) {
+    const lines = block.trim().split('\n');
+    if (lines.length < 2) continue;
+
+    let timeLineIndex = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].includes('-->')) {
+        timeLineIndex = i;
+        break;
+      }
+    }
+    if (timeLineIndex === -1) continue;
+
+    const timeLine = lines[timeLineIndex];
+    const [startStr, endStr] = timeLine.split('-->');
+    if (!startStr || !endStr) continue;
+
+    const start = timeToSec(startStr.trim().split(' ')[0]);
+    const end = timeToSec(endStr.trim().split(' ')[0]);
+
+    const textLines = lines.slice(timeLineIndex + 1);
+    const cleanText = textLines
+      .join('\n')
+      .replace(/<[^>]*>/g, '')
+      .replace(/\{[^}]*\}/g, '')
+      .trim();
+
+    if (cleanText && end > start) {
+      cues.push({ start, end, text: cleanText });
+    }
+  }
+
+  return cues;
+}
+
+function mapLibavCodecToWebCodecs(codecId: number | string, codecName?: string): string {
+  const name = (codecName || '').toLowerCase();
+
+  // AV1: 222 in libav / FFmpeg
+  if (name.includes('av1') || codecId === 222 || codecId === 225 || codecId === 'av1') {
+    return 'av01.0.08M.08';
+  }
+  // HEVC / H.265: 173 in FFmpeg
+  if (name.includes('hevc') || name.includes('h265') || codecId === 173 || codecId === 'hevc') {
+    return 'hev1.1.6.L93.B0';
+  }
+  // VP9: 167 in FFmpeg
+  if (name.includes('vp9') || codecId === 167 || codecId === 'vp9') {
+    return 'vp09.00.10.08';
+  }
+  // VP8: 139 in FFmpeg
+  if (name.includes('vp8') || codecId === 139 || codecId === 'vp8') {
+    return 'vp8';
+  }
+  return 'avc1.4d401f';
+}
+
+self.onmessage = async (e: MessageEvent<WorkerStartMessage | WorkerInspectMessage>) => {
+  if (e.data.type === 'INSPECT') {
+    try {
+      const streams = await inspectFile(e.data.file);
+      postMessage({ type: 'INSPECT_RESULT', streams } as WorkerInspectResultMessage);
+    } catch (err: any) {
+      log('error', `Échec d'inspection: ${err?.message || err}`);
+    }
+    return;
+  }
+
   if (e.data.type !== 'START') return;
 
-  const file = e.data.file;
+  const { file, selectedAudioIndex, selectedSubtitleIndex, externalSubtitleContent } = e.data;
   log('info', `Début du traitement de "${file.name}" (${(file.size / (1024 * 1024)).toFixed(2)} Mo)`);
 
   try {
-    await processVideoFile(file);
+    await processVideoFile(file, selectedAudioIndex, selectedSubtitleIndex, externalSubtitleContent);
     postMessage({ type: 'DONE' } as WorkerDoneMessage);
   } catch (err: any) {
     const errorMsg = err && err.stack ? `${err.name || 'Error'}: ${err.message || err}\n${err.stack}` : String(err?.message || err);
@@ -68,38 +184,79 @@ self.onmessage = async (e: MessageEvent<WorkerStartMessage>) => {
   }
 };
 
-function mapLibavCodecToWebCodecs(codecId: number | string, codecName?: string): string {
-  const name = (codecName || '').toLowerCase();
-
-  if (name.includes('hevc') || name.includes('h265') || codecId === 173 || codecId === 'hevc') {
-    return 'hev1.1.6.L93.B0';
+async function getLibavInstance() {
+  let base = new URL('../libav/', import.meta.url).href;
+  if (!base.endsWith('/')) {
+    base += '/';
   }
-  if (name.includes('vp9') || codecId === 167 || codecId === 'vp9') {
-    return 'vp09.00.10.08';
-  }
-  if (name.includes('vp8') || codecId === 139 || codecId === 'vp8') {
-    return 'vp8';
-  }
-  if (name.includes('av1') || codecId === 225 || codecId === 'av1') {
-    return 'av01.0.04M.08';
-  }
-  return 'avc1.4d401f';
-}
-
-async function processVideoFile(file: File) {
-  log('info', 'Chargement du module WASM libav.js (variante webcodecs)...');
-  // Worker is located at [base]/assets/pipeline.worker-[hash].js
-  // Resolve base directory relative to the worker script location
-  const base = new URL('../libav/', import.meta.url).href;
-
-  const libav = await LibAV.LibAV({
+  return await LibAV.LibAV({
     noworker: true,
     variant: 'webcodecs',
     base,
     toImport: `${base}libav-6.10.9.0-webcodecs.wasm.mjs`,
   });
+}
 
-  const filename = file.name || 'input_file.mkv';
+async function inspectFile(file: File): Promise<StreamInfo[]> {
+  const libav = await getLibavInstance();
+  const filename = `inspect_${Date.now()}_${file.name}`;
+  const arrayBuf = await file.arrayBuffer();
+  await libav.writeFile(filename, new Uint8Array(arrayBuf));
+
+  const [fmt_ctx, streams] = await libav.ff_init_demuxer_file(filename);
+  const streamInfos: StreamInfo[] = [];
+
+  for (const s of streams) {
+    const codecName = await libav.avcodec_get_name(s.codec_id);
+    let type: StreamInfo['type'] = 'unknown';
+    if (s.codec_type === 0) type = 'video';
+    else if (s.codec_type === 1) type = 'audio';
+    else if (s.codec_type === 3) type = 'subtitle';
+
+    const lang = s.metadata?.language || 'und';
+    const title = s.metadata?.title || s.metadata?.handler_name || '';
+
+    const info: StreamInfo = {
+      index: s.index,
+      type,
+      codecId: s.codec_id,
+      codecName: codecName || `codec_${s.codec_id}`,
+      language: lang,
+      title: title.trim(),
+    };
+
+    if (s.codecpar) {
+      if (type === 'video') {
+        info.width = await (libav as any).AVCodecParameters_width(s.codecpar);
+        info.height = await (libav as any).AVCodecParameters_height(s.codecpar);
+      } else if (type === 'audio') {
+        info.sampleRate = await (libav as any).AVCodecParameters_sample_rate(s.codecpar);
+        try {
+          info.channels = await (libav as any).AVCodecParameters_ch_layout_nb_channels(s.codecpar);
+        } catch {
+          info.channels = 2;
+        }
+      }
+    }
+
+    streamInfos.push(info);
+  }
+
+  await libav.avformat_close_input_js(fmt_ctx);
+  await libav.unlink(filename);
+  return streamInfos;
+}
+
+async function processVideoFile(
+  file: File,
+  selectedAudioIndex?: number,
+  selectedSubtitleIndex?: number,
+  externalSubtitleContent?: string
+) {
+  log('info', 'Chargement du module WASM libav.js (variante webcodecs)...');
+  const libav = await getLibavInstance();
+
+  const filename = `input_${Date.now()}_${file.name || 'video.mkv'}`;
 
   log('info', 'Chargement du fichier vidéo en mémoire virtuelle...');
   const arrayBuf = await file.arrayBuffer();
@@ -110,8 +267,11 @@ async function processVideoFile(file: File) {
 
   let videoStreamIndex = -1;
   let audioStreamIndex = -1;
+  let subtitleStreamIndex = -1;
+
   let videoStream: any = null;
   let audioStream: any = null;
+  let subtitleStream: any = null;
 
   for (let i = 0; i < streams.length; i++) {
     const s: any = streams[i];
@@ -130,12 +290,27 @@ async function processVideoFile(file: File) {
         s.extradata = await (libav as any).copyout_u8(extradataPtr, extradataSize);
       }
     }
-    if (s.codec_type === libav.AVMEDIA_TYPE_VIDEO && videoStreamIndex === -1) {
+
+    if (s.codec_type === 0 && videoStreamIndex === -1) {
       videoStreamIndex = i;
       videoStream = s;
-    } else if (s.codec_type === libav.AVMEDIA_TYPE_AUDIO && audioStreamIndex === -1) {
-      audioStreamIndex = i;
-      audioStream = s;
+    } else if (s.codec_type === 1) {
+      if (selectedAudioIndex !== undefined && selectedAudioIndex >= 0) {
+        if (s.index === selectedAudioIndex) {
+          audioStreamIndex = i;
+          audioStream = s;
+        }
+      } else if (audioStreamIndex === -1) {
+        audioStreamIndex = i;
+        audioStream = s;
+      }
+    } else if (s.codec_type === 3) {
+      if (selectedSubtitleIndex !== undefined && selectedSubtitleIndex >= 0) {
+        if (s.index === selectedSubtitleIndex) {
+          subtitleStreamIndex = i;
+          subtitleStream = s;
+        }
+      }
     }
   }
 
@@ -146,21 +321,34 @@ async function processVideoFile(file: File) {
   const durationSec = videoStream.duration_time || (file.size / 1000000) * 0.5;
   log('info', `Flux vidéo détecté [Index ${videoStreamIndex}]: Codec ID ${videoStream.codec_id}, ${videoStream.width}x${videoStream.height}`);
   if (audioStream) {
-    log('info', `Flux audio détecté [Index ${audioStreamIndex}]: Codec ID ${audioStream.codec_id}, ${audioStream.channels} canaux, ${audioStream.sample_rate} Hz`);
+    log('info', `Flux audio sélectionné [Index ${audioStream.index}]: Codec ID ${audioStream.codec_id}, ${audioStream.channels} canaux, ${audioStream.sample_rate} Hz`);
   }
 
   const isH264 = videoStream.codec_id === 27 || videoStream.codec_id === 'h264' || videoStream.codec_name === 'h264';
   const isAAC = audioStream && (audioStream.codec_id === 86018 || audioStream.codec_id === 'aac' || audioStream.codec_name === 'aac');
 
-  const videoPassthrough = isH264;
-  const audioPassthrough = audioStream ? isAAC : false;
+  // Subtitle cues setup
+  const subtitleCues: SubtitleCue[] = [];
+  if (externalSubtitleContent) {
+    subtitleCues.push(...parseSRTorVTT(externalSubtitleContent));
+    log('info', `Sous-titre externe chargé: ${subtitleCues.length} répliques trouvées.`);
+  }
 
+  const burnInSubtitles = subtitleCues.length > 0 || subtitleStreamIndex >= 0;
+
+  // Video passthrough is possible ONLY if H.264 AND NO subtitle burn-in requested
+  const videoPassthrough = isH264 && !burnInSubtitles;
+  const audioPassthrough = audioStream ? isAAC : false;
   const mode: 'COPY' | 'TRANSCODE' = videoPassthrough ? 'COPY' : 'TRANSCODE';
 
   if (videoPassthrough) {
     log('success', 'Mode vidéo: COPIE DIRECTE / PASSTHROUGH (H.264 détecté - remuxing instantané)');
   } else {
-    log('warn', `Mode vidéo: RÉENCODAGE MATÉRIEL WEBCODECS GPU (Codec source ${videoStream.codec_name || videoStream.codec_id})`);
+    if (burnInSubtitles) {
+      log('warn', `Mode vidéo: RÉENCODAGE AVEC INCRUSTATION SOUS-TITRES (Burn-in actif)`);
+    } else {
+      log('warn', `Mode vidéo: RÉENCODAGE MATÉRIEL WEBCODECS GPU (Codec source ${videoStream.codec_name || videoStream.codec_id})`);
+    }
   }
 
   if (audioStream) {
@@ -179,12 +367,15 @@ async function processVideoFile(file: File) {
     },
   });
 
+  const targetWidth = videoStream.width || 1920;
+  const targetHeight = videoStream.height || 1080;
+
   const muxerConfig: MP4Muxer.MuxerOptions<MP4Muxer.StreamTarget> = {
     target: streamTarget,
     video: {
       codec: 'avc',
-      width: videoStream.width || 1920,
-      height: videoStream.height || 1080,
+      width: targetWidth,
+      height: targetHeight,
     },
     fastStart: 'in-memory',
   };
@@ -201,13 +392,26 @@ async function processVideoFile(file: File) {
 
   let videoDecoder: VideoDecoder | null = null;
   let videoEncoder: VideoEncoder | null = null;
+  let canvas: OffscreenCanvas | null = null;
+  let ctx: OffscreenCanvasRenderingContext2D | null = null;
   let encodedFramesCount = 0;
 
   if (!videoPassthrough) {
     if (typeof VideoEncoder === 'undefined' || typeof VideoDecoder === 'undefined') {
       throw new Error(
-        `Ce navigateur ne supporte pas WebCodecs (VideoEncoder/VideoDecoder) nécessaire pour réencoder ce format vidéo (${videoStream.codec_name || videoStream.codec_id}). Veuillez utiliser Chrome/Edge ou fournir un fichier source en H.264.`
+        `Ce navigateur ne supporte pas WebCodecs (VideoEncoder/VideoDecoder) nécessaire pour réencoder ce format vidéo (${videoStream.codec_name || videoStream.codec_id}). Veuillez utiliser Chrome/Edge ou fournir un fichier source en H.264 sans burn-in.`
       );
+    }
+
+    // Determine H.264 encoder level based on resolution
+    // Level 5.1 (0x33) supports up to 4K / 1080p60
+    // Level 4.0 (0x28) supports 1080p
+    const pixels = targetWidth * targetHeight;
+    let avcCodecString = 'avc1.640033'; // High Profile Level 5.1
+    if (pixels <= 921600) {
+      avcCodecString = 'avc1.4d401f'; // Main Level 3.1 for 720p or lower
+    } else if (pixels <= 2097152) {
+      avcCodecString = 'avc1.4d4028'; // Main Level 4.0 for 1080p
     }
 
     videoEncoder = new VideoEncoder({
@@ -218,20 +422,68 @@ async function processVideoFile(file: File) {
       error: (e) => log('error', `Erreur VideoEncoder: ${e.message}`),
     });
 
+    // Detect hardware support, fallback to 'no-preference'
+    let encoderHw: HardwareAcceleration = 'prefer-hardware';
+    try {
+      const hwCheck = await VideoEncoder.isConfigSupported({
+        codec: avcCodecString,
+        width: targetWidth,
+        height: targetHeight,
+        hardwareAcceleration: 'prefer-hardware',
+      });
+      if (!hwCheck.supported) {
+        encoderHw = 'no-preference';
+      }
+    } catch {
+      encoderHw = 'no-preference';
+    }
+
     videoEncoder.configure({
-      codec: 'avc1.4d401f',
-      width: videoStream.width || 1920,
-      height: videoStream.height || 1080,
+      codec: avcCodecString,
+      width: targetWidth,
+      height: targetHeight,
       bitrate: 5_000_000,
       framerate: 30,
-      hardwareAcceleration: 'prefer-hardware',
+      hardwareAcceleration: encoderHw,
     });
+
+    if (burnInSubtitles) {
+      canvas = new OffscreenCanvas(targetWidth, targetHeight);
+      ctx = canvas.getContext('2d', { willReadFrequently: false });
+    }
 
     videoDecoder = new VideoDecoder({
       output: (frame) => {
         const keyFrame = encodedFramesCount % 60 === 0;
-        if (videoEncoder && videoEncoder.state === 'configured') {
-          videoEncoder.encode(frame, { keyFrame });
+
+        if (burnInSubtitles && ctx && canvas) {
+          // Draw decoded frame to OffscreenCanvas
+          ctx.drawImage(frame, 0, 0, targetWidth, targetHeight);
+
+          // Find active subtitle cue for current timestamp (in seconds)
+          const currentTimeSec = frame.timestamp / 1000000;
+          const activeCue = subtitleCues.find(
+            (c) => currentTimeSec >= c.start && currentTimeSec <= c.end
+          );
+
+          if (activeCue) {
+            renderSubtitleText(ctx, activeCue.text, targetWidth, targetHeight);
+          }
+
+          // Create new VideoFrame from canvas
+          const compositeFrame = new VideoFrame(canvas, {
+            timestamp: frame.timestamp,
+            duration: frame.duration || 33333,
+          });
+
+          if (videoEncoder && videoEncoder.state === 'configured') {
+            videoEncoder.encode(compositeFrame, { keyFrame });
+          }
+          compositeFrame.close();
+        } else {
+          if (videoEncoder && videoEncoder.state === 'configured') {
+            videoEncoder.encode(frame, { keyFrame });
+          }
         }
         frame.close();
       },
@@ -239,11 +491,26 @@ async function processVideoFile(file: File) {
     });
 
     const inputDecoderCodec = mapLibavCodecToWebCodecs(videoStream.codec_id, videoStream.codec_name);
+    let decoderHw: HardwareAcceleration = 'prefer-hardware';
+    try {
+      const decCheck = await VideoDecoder.isConfigSupported({
+        codec: inputDecoderCodec,
+        hardwareAcceleration: 'prefer-hardware',
+      });
+      if (!decCheck.supported) {
+        decoderHw = 'no-preference';
+      }
+    } catch {
+      decoderHw = 'no-preference';
+    }
+
     const decoderConfig: VideoDecoderConfig = {
       codec: inputDecoderCodec,
-      hardwareAcceleration: 'prefer-hardware',
+      hardwareAcceleration: decoderHw,
     };
-    if (videoStream.extradata) {
+
+    // Only provide description if AVC/H.264 extradata
+    if (videoStream.extradata && videoStream.codec_id === 27) {
       decoderConfig.description = videoStream.extradata;
     }
 
@@ -258,27 +525,32 @@ async function processVideoFile(file: File) {
     if (typeof AudioEncoder === 'undefined') {
       log('warn', `AudioEncoder non supporté par ce navigateur. L'audio source (${audioStream.codec_name || audioStream.codec_id}) sera omis.`);
     } else {
-      audioCodecCtx = await libav.avcodec_alloc_context3(audioStream.codec_id);
-      await libav.avcodec_parameters_to_context(audioCodecCtx, audioStream);
-      const openRes = await libav.avcodec_open2_js(audioCodecCtx, 0, 0);
-      if (openRes < 0) {
-        log('warn', `Impossible d'ouvrir le décodeur audio libav (${openRes}), l'audio sera ignoré.`);
-        audioCodecCtx = null;
+      const dec = await libav.avcodec_find_decoder(audioStream.codec_id);
+      if (!dec) {
+        log('warn', `Décodeur non trouvé dans libav pour audio codec ${audioStream.codec_id}, l'audio sera ignoré.`);
       } else {
-        audioFrame = await libav.av_frame_alloc();
-        audioEncoder = new AudioEncoder({
-          output: (chunk, metadata) => {
-            muxer.addAudioChunk(chunk, metadata);
-          },
-          error: (e) => log('error', `Erreur AudioEncoder: ${e.message}`),
-        });
+        audioCodecCtx = await libav.avcodec_alloc_context3(dec);
+        await libav.avcodec_parameters_to_context(audioCodecCtx, audioStream);
+        const openRes = await libav.avcodec_open2_js(audioCodecCtx, dec, 0);
+        if (openRes < 0) {
+          log('warn', `Impossible d'ouvrir le décodeur audio libav (${openRes}), l'audio sera ignoré.`);
+          audioCodecCtx = null;
+        } else {
+          audioFrame = await libav.av_frame_alloc();
+          audioEncoder = new AudioEncoder({
+            output: (chunk, metadata) => {
+              muxer.addAudioChunk(chunk, metadata);
+            },
+            error: (e) => log('error', `Erreur AudioEncoder: ${e.message}`),
+          });
 
-        audioEncoder.configure({
-          codec: 'mp4a.40.2',
-          numberOfChannels: 2,
-          sampleRate: audioStream.sample_rate || 44100,
-          bitrate: 192000,
-        });
+          audioEncoder.configure({
+            codec: 'mp4a.40.2',
+            numberOfChannels: 2,
+            sampleRate: audioStream.sample_rate || 44100,
+            bitrate: 192000,
+          });
+        }
       }
     }
   }
@@ -360,7 +632,7 @@ async function processVideoFile(file: File) {
           mode,
         } as WorkerProgressMessage);
       }
-    } else if (audioStream && streamIndex === audioStreamIndex) {
+    } else if (audioStream && streamIndex === audioStream.index) {
       const ptsUs = (pts * audioStream.time_base_num * 1000000) / audioStream.time_base_den;
       const isKeyFrame = Boolean(flags & 1);
       const audioDuration = (duration * audioStream.time_base_num * 1000000) / audioStream.time_base_den || 23219;
@@ -422,10 +694,33 @@ async function processVideoFile(file: File) {
           }
         }
       }
+    } else if (subtitleStream && streamIndex === subtitleStream.index) {
+      // Decode or parse embedded text subtitle packet
+      try {
+        const textDecoder = new TextDecoder('utf-8');
+        const subText = textDecoder.decode(pktData);
+        const ptsSec = (pts * subtitleStream.time_base_num) / subtitleStream.time_base_den;
+        const durSec = (duration * subtitleStream.time_base_num) / subtitleStream.time_base_den || 3.0;
+
+        const cleanText = subText
+          .replace(/<[^>]*>/g, '')
+          .replace(/\{[^}]*\}/g, '')
+          .trim();
+
+        if (cleanText) {
+          subtitleCues.push({
+            start: ptsSec,
+            end: ptsSec + durSec,
+            text: cleanText,
+          });
+        }
+      } catch {
+        // ignore subtitle parse error
+      }
     }
   }
 
-  await libav.av_packet_free(pkt);
+  await libav.av_packet_free_js(pkt);
 
   if (audioFrame) {
     await libav.av_frame_free(audioFrame);
@@ -450,4 +745,38 @@ async function processVideoFile(file: File) {
   await libav.unlink(filename);
 
   log('success', 'Conversion terminée avec succès !');
+}
+
+function renderSubtitleText(
+  ctx: OffscreenCanvasRenderingContext2D,
+  text: string,
+  width: number,
+  height: number
+) {
+  const fontSize = Math.max(18, Math.round(height * 0.045));
+  ctx.save();
+  ctx.font = `bold ${fontSize}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+
+  const lines = text.split('\n');
+  const lineHeight = fontSize * 1.25;
+  const bottomMargin = Math.round(height * 0.07);
+  const startY = height - bottomMargin - (lines.length - 1) * lineHeight;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const y = startY + i * lineHeight;
+    const x = width / 2;
+
+    // Outer shadow / outline for readability
+    ctx.lineWidth = Math.max(3, Math.round(fontSize * 0.15));
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.9)';
+    ctx.strokeText(line, x, y);
+
+    // Text fill (crisp white)
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(line, x, y);
+  }
+  ctx.restore();
 }

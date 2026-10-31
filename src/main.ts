@@ -1,6 +1,5 @@
-import './style.css';
 import { createWritableStream, StreamWritable } from './streamSaver';
-import { WorkerStartMessage, WorkerToMainMessage } from './workers/pipeline.worker';
+import { StreamInfo, WorkerProgressMessage, WorkerToMainMessage } from './workers/pipeline.worker';
 
 // UI DOM Elements
 const dropZone = document.getElementById('drop-zone') as HTMLElement;
@@ -11,6 +10,12 @@ const processCard = document.getElementById('process-card') as HTMLElement;
 const fileNameEl = document.getElementById('file-name') as HTMLElement;
 const fileSizeEl = document.getElementById('file-size') as HTMLElement;
 const modeBadge = document.getElementById('processing-mode-badge') as HTMLElement;
+const compatWarning = document.getElementById('compat-warning') as HTMLElement;
+
+const audioTrackSelect = document.getElementById('audio-track-select') as HTMLSelectElement;
+const subtitleTrackSelect = document.getElementById('subtitle-track-select') as HTMLSelectElement;
+const subFileInput = document.getElementById('sub-file-input') as HTMLInputElement;
+const externalSubName = document.getElementById('external-sub-name') as HTMLElement;
 
 const startBtn = document.getElementById('start-btn') as HTMLButtonElement;
 const resetBtn = document.getElementById('reset-btn') as HTMLButtonElement;
@@ -44,9 +49,16 @@ const audioSourceBtn = document.getElementById('audio-source-btn') as HTMLButton
 const downloadBtn = document.getElementById('download-btn') as HTMLAnchorElement;
 
 let selectedFile: File | null = null;
+let externalSubtitleContent: string | undefined = undefined;
 let activeWorker: Worker | null = null;
 let activeWritableStream: StreamWritable | null = null;
 let outputChunks: Uint8Array[] = [];
+
+// Detect WebCodecs VideoEncoder support
+const supportsWebCodecsVideo = typeof (window as any).VideoEncoder !== 'undefined';
+if (!supportsWebCodecsVideo && compatWarning) {
+  compatWarning.classList.remove('hidden');
+}
 
 // Log helper
 function appendLog(level: 'info' | 'warn' | 'error' | 'success', message: string) {
@@ -90,14 +102,44 @@ dropZone.addEventListener('drop', (e) => {
   }
 });
 
+subFileInput.addEventListener('change', async () => {
+  if (subFileInput.files && subFileInput.files.length > 0) {
+    const file = subFileInput.files[0];
+    try {
+      externalSubtitleContent = await file.text();
+      externalSubName.textContent = `✓ ${file.name}`;
+      externalSubName.classList.remove('hidden');
+
+      let extOpt = subtitleTrackSelect.querySelector('option[value="external"]') as HTMLOptionElement;
+      if (!extOpt) {
+        extOpt = document.createElement('option');
+        extOpt.value = 'external';
+        subtitleTrackSelect.appendChild(extOpt);
+      }
+      extOpt.textContent = `Incruster sous-titre externe (${file.name})`;
+      subtitleTrackSelect.value = 'external';
+
+      appendLog('info', `Fichier sous-titres importé: ${file.name}`);
+    } catch (err: any) {
+      appendLog('error', `Erreur lecture sous-titres: ${err?.message || err}`);
+    }
+  }
+});
+
 resetBtn.addEventListener('click', () => {
   if (activeWorker) {
     activeWorker.terminate();
     activeWorker = null;
   }
   selectedFile = null;
+  externalSubtitleContent = undefined;
   outputChunks = [];
   fileInput.value = '';
+  subFileInput.value = '';
+  externalSubName.textContent = '';
+  externalSubName.classList.add('hidden');
+  audioTrackSelect.innerHTML = '<option value="-1">Détection automatique...</option>';
+  subtitleTrackSelect.innerHTML = '<option value="none">Aucun (Pas de sous-titres)</option>';
   processCard.classList.add('hidden');
   compareSection.classList.add('hidden');
   dropZone.classList.remove('hidden');
@@ -123,6 +165,70 @@ function handleFileSelected(file: File) {
   dropZone.classList.add('hidden');
   processCard.classList.remove('hidden');
   appendLog('info', `Fichier chargé: ${file.name}`);
+
+  // Inspect file tracks with background worker
+  inspectContainerTracks(file);
+}
+
+function inspectContainerTracks(file: File) {
+  appendLog('info', 'Analyse rapide des pistes audio et sous-titres...');
+  const inspectWorker = new Worker(new URL('./workers/pipeline.worker.ts', import.meta.url), {
+    type: 'module',
+  });
+
+  inspectWorker.onmessage = (e: MessageEvent<WorkerToMainMessage>) => {
+    const data = e.data;
+    if (data.type === 'INSPECT_RESULT') {
+      populateTrackSelectors(data.streams);
+      inspectWorker.terminate();
+    } else if (data.type === 'LOG') {
+      appendLog(data.level, data.message);
+    }
+  };
+
+  inspectWorker.postMessage({ type: 'INSPECT', file });
+}
+
+function populateTrackSelectors(streams: StreamInfo[]) {
+  const audioStreams = streams.filter((s) => s.type === 'audio');
+  const subStreams = streams.filter((s) => s.type === 'subtitle');
+
+  // Populate Audio Select
+  audioTrackSelect.innerHTML = '';
+  if (audioStreams.length === 0) {
+    audioTrackSelect.innerHTML = '<option value="-1">Aucune piste audio détectée</option>';
+  } else {
+    audioStreams.forEach((s) => {
+      const opt = document.createElement('option');
+      opt.value = s.index.toString();
+      const langUpper = (s.language || 'und').toUpperCase();
+      const titleStr = s.title ? ` (${s.title})` : '';
+      const codecStr = s.codecName.toUpperCase();
+      opt.textContent = `Piste ${s.index}: [${langUpper}] ${codecStr} - ${s.channels || 2} ch${titleStr}`;
+      audioTrackSelect.appendChild(opt);
+    });
+  }
+
+  // Populate Subtitle Select
+  subtitleTrackSelect.innerHTML = '<option value="none">Aucun (Pas de sous-titres)</option>';
+  if (externalSubtitleContent) {
+    const extOpt = document.createElement('option');
+    extOpt.value = 'external';
+    extOpt.textContent = 'Sous-titre externe (.srt / .vtt)';
+    extOpt.selected = true;
+    subtitleTrackSelect.appendChild(extOpt);
+  }
+
+  subStreams.forEach((s) => {
+    const opt = document.createElement('option');
+    opt.value = s.index.toString();
+    const langUpper = (s.language || 'und').toUpperCase();
+    const titleStr = s.title ? ` (${s.title})` : '';
+    opt.textContent = `Incruster Piste ${s.index}: [${langUpper}] ${s.codecName.toUpperCase()}${titleStr}`;
+    subtitleTrackSelect.appendChild(opt);
+  });
+
+  appendLog('success', `Pistes détectées: ${audioStreams.length} audio, ${subStreams.length} sous-titres.`);
 }
 
 function formatETA(seconds: number): string {
@@ -173,7 +279,7 @@ compareTimeline.addEventListener('input', () => {
   convertedPreview.currentTime = seekTime;
 });
 
-// Audio track switching
+// Audio track switching in comparator
 audioConvertedBtn.addEventListener('click', () => {
   audioConvertedBtn.classList.add('active');
   audioSourceBtn.classList.remove('active');
@@ -194,6 +300,12 @@ startBtn.addEventListener('click', async () => {
 
   outputChunks = [];
   const outputFilename = selectedFile.name.replace(/\.[^/.]+$/, '') + '_converted.mp4';
+
+  const selectedAudioIndex = parseInt(audioTrackSelect.value, 10);
+  let selectedSubtitleIndex: number | undefined = undefined;
+  if (subtitleTrackSelect.value !== 'none' && subtitleTrackSelect.value !== 'external') {
+    selectedSubtitleIndex = parseInt(subtitleTrackSelect.value, 10);
+  }
 
   try {
     startBtn.disabled = true;
@@ -216,16 +328,17 @@ startBtn.addEventListener('click', async () => {
       if (data.type === 'LOG') {
         appendLog(data.level, data.message);
       } else if (data.type === 'PROGRESS') {
-        progressBarFill.style.width = `${data.percent}%`;
-        progressPercent.textContent = `${data.percent}%`;
+        const pMsg = data as WorkerProgressMessage;
+        progressBarFill.style.width = `${pMsg.percent}%`;
+        progressPercent.textContent = `${pMsg.percent}%`;
 
-        statFps.textContent = `${data.fps}`;
-        statSpeed.textContent = `${data.speed}x`;
-        statBitrate.textContent = `${data.bitrateMBs} Mo/s`;
-        statEta.textContent = formatETA(data.etaSeconds);
+        statFps.textContent = `${pMsg.fps}`;
+        statSpeed.textContent = `${pMsg.speed}x`;
+        statBitrate.textContent = `${pMsg.bitrateMBs} Mo/s`;
+        statEta.textContent = formatETA(pMsg.etaSeconds);
 
         modeBadge.classList.remove('hidden');
-        if (data.mode === 'COPY') {
+        if (pMsg.mode === 'COPY') {
           modeBadge.textContent = 'Mode Copie Directe (Passthrough)';
           modeBadge.className = 'badge badge-mode';
         } else {
@@ -278,11 +391,13 @@ startBtn.addEventListener('click', async () => {
       }
     };
 
-    const startMsg: WorkerStartMessage = {
+    activeWorker.postMessage({
       type: 'START',
       file: selectedFile,
-    };
-    activeWorker.postMessage(startMsg);
+      selectedAudioIndex: selectedAudioIndex >= 0 ? selectedAudioIndex : undefined,
+      selectedSubtitleIndex,
+      externalSubtitleContent: subtitleTrackSelect.value === 'external' ? externalSubtitleContent : undefined,
+    });
   } catch (err: any) {
     appendLog('error', `Impossible de démarrer: ${err.message || err}`);
     startBtn.disabled = false;

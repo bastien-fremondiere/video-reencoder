@@ -23,6 +23,15 @@
       </header>
 
       <main class="app-main">
+        <!-- Compatibility Warning Banner (Hidden if WebCodecs is supported) -->
+        <div id="compat-warning" class="compat-warning hidden">
+          <div class="compat-warning-icon">⚠️</div>
+          <div class="compat-warning-content">
+            <strong>Compatibilité Navigateur Détectée :</strong>
+            <span>Votre navigateur (ex: Firefox) ne supporte pas l'API native <code>WebCodecs</code> (VideoEncoder). La copie directe (passthrough H.264) fonctionne à 100%, mais pour réencoder des flux vidéo (AV1, HEVC, VP9) ou incruster des sous-titres (burn-in), utilisez <strong>Google Chrome</strong>, <strong>Microsoft Edge</strong> ou <strong>Brave</strong>.</span>
+          </div>
+        </div>
+
         <!-- Zone Drag & Drop -->
         <section id="drop-zone" class="drop-zone">
           <input type="file" id="file-input" accept="video/*,.mkv,.webm,.mp4,.mov,.avi,.ts" hidden />
@@ -47,6 +56,45 @@
             </div>
             <div id="processing-mode-badge" class="badge badge-mode hidden">
               Mode Copie Directe
+            </div>
+          </div>
+
+          <!-- Stream Selection Options (Audio & Subtitles) -->
+          <div id="tracks-config-section" class="tracks-config-section">
+            <div class="track-select-row">
+              <div class="track-select-group">
+                <label for="audio-track-select">
+                  <svg class="track-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                  </svg>
+                  Piste Audio :
+                </label>
+                <select id="audio-track-select" class="form-select">
+                  <option value="-1">Détection automatique...</option>
+                </select>
+              </div>
+
+              <div class="track-select-group">
+                <label for="subtitle-track-select">
+                  <svg class="track-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="2" y="4" width="20" height="16" rx="2"></rect>
+                    <path d="M6 12h4M14 12h4M6 16h12M6 8h12"></path>
+                  </svg>
+                  Incrustation Sous-Titres (Burn-in) :
+                </label>
+                <select id="subtitle-track-select" class="form-select">
+                  <option value="none">Aucun (Pas de sous-titres)</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="external-sub-row">
+              <label for="sub-file-input" class="sub-file-label">
+                <span>Ou importer un sous-titre externe (.srt, .vtt) :</span>
+                <input type="file" id="sub-file-input" accept=".srt,.vtt" class="sub-file-input" />
+              </label>
+              <span id="external-sub-name" class="external-sub-name hidden"></span>
             </div>
           </div>
 
