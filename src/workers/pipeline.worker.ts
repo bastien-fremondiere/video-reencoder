@@ -200,8 +200,19 @@ async function getLibavInstance() {
 async function inspectFile(file: File): Promise<StreamInfo[]> {
   const libav = await getLibavInstance();
   const filename = `inspect_${Date.now()}_${file.name}`;
-  const arrayBuf = await file.arrayBuffer();
-  await libav.writeFile(filename, new Uint8Array(arrayBuf));
+
+  // Stream slices on demand via block reader device (Zero-OOM)
+  (libav as any).onblockread = async (name: string, pos: number, length: number) => {
+    try {
+      const slice = file.slice(pos, pos + length);
+      const ab = await slice.arrayBuffer();
+      await (libav as any).ff_block_reader_dev_send(name, pos, new Uint8Array(ab));
+    } catch (e) {
+      console.error('Error onblockread (inspect):', e);
+    }
+  };
+
+  await (libav as any).mkblockreaderdev(filename, file.size);
 
   const [fmt_ctx, streams] = await libav.ff_init_demuxer_file(filename);
   const streamInfos: StreamInfo[] = [];
@@ -258,9 +269,18 @@ async function processVideoFile(
 
   const filename = `input_${Date.now()}_${file.name || 'video.mkv'}`;
 
-  log('info', 'Chargement du fichier vidéo en mémoire virtuelle...');
-  const arrayBuf = await file.arrayBuffer();
-  await libav.writeFile(filename, new Uint8Array(arrayBuf));
+  log('info', 'Initialisation du lecteur de flux continu (Streaming Zéro-RAM)...');
+  (libav as any).onblockread = async (name: string, pos: number, length: number) => {
+    try {
+      const slice = file.slice(pos, pos + length);
+      const ab = await slice.arrayBuffer();
+      await (libav as any).ff_block_reader_dev_send(name, pos, new Uint8Array(ab));
+    } catch (e) {
+      console.error('Error onblockread (pipeline):', e);
+    }
+  };
+
+  await (libav as any).mkblockreaderdev(filename, file.size);
 
   log('info', 'Ouverture du fichier et analyse des flux...');
   const [fmt_ctx, streams] = await libav.ff_init_demuxer_file(filename);
@@ -519,38 +539,40 @@ async function processVideoFile(
 
   let audioEncoder: AudioEncoder | null = null;
   let audioCodecCtx: any = null;
+  let audioPkt: any = null;
   let audioFrame: any = null;
 
   if (audioStream && !audioPassthrough) {
     if (typeof AudioEncoder === 'undefined') {
       log('warn', `AudioEncoder non supporté par ce navigateur. L'audio source (${audioStream.codec_name || audioStream.codec_id}) sera omis.`);
     } else {
-      const dec = await libav.avcodec_find_decoder(audioStream.codec_id);
-      if (!dec) {
-        log('warn', `Décodeur non trouvé dans libav pour audio codec ${audioStream.codec_id}, l'audio sera ignoré.`);
-      } else {
-        audioCodecCtx = await libav.avcodec_alloc_context3(dec);
-        await libav.avcodec_parameters_to_context(audioCodecCtx, audioStream);
-        const openRes = await libav.avcodec_open2_js(audioCodecCtx, dec, 0);
-        if (openRes < 0) {
-          log('warn', `Impossible d'ouvrir le décodeur audio libav (${openRes}), l'audio sera ignoré.`);
-          audioCodecCtx = null;
-        } else {
-          audioFrame = await libav.av_frame_alloc();
-          audioEncoder = new AudioEncoder({
-            output: (chunk, metadata) => {
-              muxer.addAudioChunk(chunk, metadata);
-            },
-            error: (e) => log('error', `Erreur AudioEncoder: ${e.message}`),
-          });
+      try {
+        const decInit = await (libav as any).ff_init_decoder(
+          audioStream.codec_id,
+          audioStream.codecpar ? { codecpar: audioStream.codecpar } : undefined
+        );
+        audioCodecCtx = decInit[1];
+        audioPkt = decInit[2];
+        audioFrame = decInit[3];
 
-          audioEncoder.configure({
-            codec: 'mp4a.40.2',
-            numberOfChannels: 2,
-            sampleRate: audioStream.sample_rate || 44100,
-            bitrate: 192000,
-          });
-        }
+        audioEncoder = new AudioEncoder({
+          output: (chunk, metadata) => {
+            muxer.addAudioChunk(chunk, metadata);
+          },
+          error: (e) => log('error', `Erreur AudioEncoder: ${e.message}`),
+        });
+
+        audioEncoder.configure({
+          codec: 'mp4a.40.2',
+          numberOfChannels: 2,
+          sampleRate: audioStream.sample_rate || 44100,
+          bitrate: 192000,
+        });
+      } catch (err: any) {
+        log('warn', `Impossible d'initialiser le décodeur audio libav (${err?.message || err}), l'audio sera ignoré.`);
+        audioCodecCtx = null;
+        audioPkt = null;
+        audioFrame = null;
       }
     }
   }
@@ -740,6 +762,14 @@ async function processVideoFile(
   }
 
   muxer.finalize();
+
+  if (audioCodecCtx && audioPkt && audioFrame) {
+    try {
+      await (libav as any).ff_free_decoder(audioCodecCtx, audioPkt, audioFrame);
+    } catch {
+      // ignore decoder cleanup error
+    }
+  }
 
   await libav.avformat_close_input_js(fmt_ctx);
   await libav.unlink(filename);

@@ -347,25 +347,38 @@ startBtn.addEventListener('click', async () => {
         }
       } else if (data.type === 'CHUNK') {
         const chunkArray = new Uint8Array(data.chunk);
-        outputChunks.push(chunkArray);
         if (activeWritableStream) {
           await activeWritableStream.write(chunkArray);
+          // If not writing directly to disk via File System Access API, keep chunk for Blob creation
+          if (!activeWritableStream.isDirectDisk) {
+            outputChunks.push(chunkArray);
+          }
+        } else {
+          outputChunks.push(chunkArray);
         }
       } else if (data.type === 'DONE') {
+        let convertedUrl = '';
         if (activeWritableStream) {
           await activeWritableStream.close();
+          if (activeWritableStream.getBlobUrl) {
+            convertedUrl = await activeWritableStream.getBlobUrl();
+          }
           activeWritableStream = null;
         }
         progressBarFill.style.width = '100%';
         progressPercent.textContent = '100%';
         appendLog('success', '🎉 Conversion et écriture sur disque réussies !');
 
-        // Prepare video comparison preview & download link
-        const blob = new Blob(outputChunks as BlobPart[], { type: 'video/mp4' });
-        const convertedUrl = URL.createObjectURL(blob);
-        convertedPreview.src = convertedUrl;
-        downloadBtn.href = convertedUrl;
-        downloadBtn.download = outputFilename;
+        if (!convertedUrl && outputChunks.length > 0) {
+          const blob = new Blob(outputChunks as BlobPart[], { type: 'video/mp4' });
+          convertedUrl = URL.createObjectURL(blob);
+        }
+
+        if (convertedUrl) {
+          convertedPreview.src = convertedUrl;
+          downloadBtn.href = convertedUrl;
+          downloadBtn.download = outputFilename;
+        }
 
         // Default: play converted audio
         convertedPreview.muted = false;
